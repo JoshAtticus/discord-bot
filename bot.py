@@ -18,6 +18,8 @@ GUILD_WELCOME_CHANNEL_ID = os.getenv("WELCOME_CHANNEL_ID")  # optional override
 CATEGORY_ID_FOR_WHAT = int(os.getenv("WHAT_CATEGORY_ID", "1373594566997053472"))
 PHOTOS_DIR = os.getenv("PHOTOS_DIR", "photos")
 BOT_PREFIX = os.getenv("BOT_PREFIX", "!")
+RULES_CHANNEL_ID = int(os.getenv("RULES_CHANNEL_ID", "1373596179203489812"))  # rules channel
+MOD_RELAY_CHANNEL_ID = int(os.getenv("MOD_RELAY_CHANNEL_ID", "1409855949560221818"))  # channel where DMs are forwarded for mods
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -29,6 +31,7 @@ logger = logging.getLogger("picl")
 # Per-command log capture structures
 _current_command_log: contextvars.ContextVar[list] = contextvars.ContextVar("current_command_log", default=None)  # type: ignore[arg-type]
 _logs_by_message: dict[int, str] = {}
+_relay_message_map: dict[int, int] = {}  # forwarded message id -> user id
 
 
 class _BufferLogHandler(logging.Handler):
@@ -70,11 +73,22 @@ async def on_member_join(member: discord.Member):
             if c.permissions_for(member.guild.me).send_messages:  # type: ignore[union-attr]
                 channel = c
                 break
+    welcome_text = (
+        f"**Welcome to the server {member.mention}! 🎉**\n"
+        f"Please read the <#{RULES_CHANNEL_ID}> before you start chatting in this server.\n\n"
+        "If you have any questions, feel free to ask Josh or any of the moderators (or anyone else, I think most people here would be happy to answer your questions 😁)\n\n"
+        f"Wanna know what *I* can do? Just type `{BOT_PREFIX}help` in chat!"
+    )
     if channel:
         try:
-            await channel.send(f"Welcome to the server, {member.mention}! 🎉")
+            await channel.send(welcome_text)
         except discord.Forbidden:
             pass
+    # Also DM the user (ignore if they have DMs closed)
+    try:
+        await member.send(welcome_text)
+    except discord.HTTPException:
+        pass
 
 
 def _start_command_log():
@@ -99,11 +113,82 @@ def _end_command_log(token, message: discord.Message | None = None):
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
-
     content_lower = message.content.lower().strip()
+
+    # --- DM Relay: user -> mods ---
+    if message.guild is None:
+        # This is a DM from a user to the bot
+        if not message.author.bot:
+            # Forward to mod relay channel
+            relay_channel = bot.get_channel(MOD_RELAY_CHANNEL_ID)
+            if relay_channel is None:
+                try:
+                    relay_channel = await bot.fetch_channel(MOD_RELAY_CHANNEL_ID)  # type: ignore
+                except Exception:
+                    relay_channel = None
+            if isinstance(relay_channel, discord.TextChannel):
+                # Build an embed to show DM content
+                embed = discord.Embed(
+                    title="New DM",
+                    description=message.content[:4000] or "(no text)",
+                    color=0x3498DB,
+                    timestamp=discord.utils.utcnow(),
+                )
+                embed.add_field(name="User", value=f"{message.author} (ID: {message.author.id})", inline=False)
+                if message.attachments:
+                    attach_list = "\n".join(a.url for a in message.attachments[:10])
+                    embed.add_field(name="Attachments", value=attach_list[:1000], inline=False)
+                try:
+                    fwd_msg = await relay_channel.send(embed=embed)
+                    _relay_message_map[fwd_msg.id] = message.author.id
+                except discord.HTTPException:
+                    pass
+        # Still allow commands in DMs
+        await bot.process_commands(message)
+        return
+
+    # --- DM Relay: mods -> user (reply in relay channel) ---
+    if (
+        message.channel.id == MOD_RELAY_CHANNEL_ID
+        and message.reference
+        and message.reference.message_id in _relay_message_map
+    ):
+        target_user_id = _relay_message_map[message.reference.message_id]
+        user = bot.get_user(target_user_id)
+        if user is None:
+            try:
+                user = await bot.fetch_user(target_user_id)
+            except discord.HTTPException:
+                user = None
+        if user:
+            msg_body = message.content or "(no text)"
+            if len(msg_body) > 1900:
+                msg_body = msg_body[:1900] + "…"
+            try:
+                files = []
+                for a in message.attachments[:5]:
+                    try:
+                        fp = await a.to_file()
+                        files.append(fp)
+                    except Exception:
+                        pass
+                await user.send(f"**Moderator Reply:**\n{msg_body}", files=files or None)
+                # Reaction acknowledgment
+                try:
+                    await message.add_reaction("✅")
+                except discord.HTTPException:
+                    pass
+            except discord.HTTPException:
+                try:
+                    await message.add_reaction("⚠️")
+                except discord.HTTPException:
+                    pass
+
+    # Feature: respond to 'what' in category (only if guild & category match)
     if (
         content_lower == "what"
-        and message.channel.category_id == CATEGORY_ID_FOR_WHAT
+        and message.guild is not None
+        and getattr(message.channel, "category_id", None) == CATEGORY_ID_FOR_WHAT
     ):
         try:
             await message.reply("https://i.ibb.co/ccKSZKwj/image.png")
