@@ -32,6 +32,12 @@ logger = logging.getLogger("picl")
 _current_command_log: contextvars.ContextVar[list] = contextvars.ContextVar("current_command_log", default=None)  # type: ignore[arg-type]
 _logs_by_message: dict[int, str] = {}
 _relay_message_map: dict[int, int] = {}  # forwarded message id -> user id
+_active_senders: set[int] = set()  # user IDs who have spoken in guild text channels
+_inactivity_task_started = False
+
+INACTIVE_KICK_DAYS = int(os.getenv("INACTIVE_KICK_DAYS", "7"))
+INACTIVE_CHECK_INTERVAL_SECONDS = int(os.getenv("INACTIVE_CHECK_INTERVAL_SECONDS", str(3600)))  # 1h default
+CHANNEL_HISTORY_SAMPLING_LIMIT = int(os.getenv("CHANNEL_HISTORY_SAMPLING_LIMIT", "200"))  # per channel on startup
 
 
 class _BufferLogHandler(logging.Handler):
@@ -56,6 +62,12 @@ bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents, help_command=None
 @bot.event
 async def on_ready():
     print(f"Picl is online as {bot.user} (ID: {bot.user.id})")
+    # Start inactivity task once per process
+    global _inactivity_task_started
+    if not _inactivity_task_started:
+        _inactivity_task_started = True
+        bot.loop.create_task(_populate_active_senders_initial())
+        bot.loop.create_task(_inactivity_enforcement_loop())
 
 
 @bot.event
@@ -114,6 +126,10 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
     content_lower = message.content.lower().strip()
+
+    # Track active sender for guild messages only
+    if message.guild is not None:
+        _active_senders.add(message.author.id)
 
     # --- DM Relay: user -> mods ---
     if message.guild is None:
@@ -192,6 +208,17 @@ async def on_message(message: discord.Message):
     ):
         try:
             await message.reply("https://i.ibb.co/ccKSZKwj/image.png")
+        except discord.HTTPException:
+            pass
+    
+    # Feature: respond to 'crazy' in category (only if guild & category match)
+    if (
+        content_lower == "crazy"
+        and message.guild is not None
+        and getattr(message.channel, "category_id", None) == CATEGORY_ID_FOR_WHAT
+    ):
+        try:
+            await message.reply("https://i.ibb.co/9k8tmgm0/image0.jpg")
         except discord.HTTPException:
             pass
 
@@ -304,6 +331,11 @@ async def help_command(ctx: commands.Context):
         value="dawg",
         inline=False,
     )
+    embed.add_field(
+        name="crazy",
+        value="i was crazy once",
+        inline=False,
+    )
     embed.set_footer(text="picl • made by joshatticus")
     try:
         await ctx.send(embed=embed)
@@ -324,6 +356,85 @@ def main():
     if not TOKEN:
         raise SystemExit("DISCORD_TOKEN not set. Put it in a .env file or env var.")
     bot.run(TOKEN)
+
+
+# ---------------- Inactivity Enforcement ---------------- #
+
+async def _populate_active_senders_initial():
+    """Sample recent channel history to avoid false positives after a restart.
+
+    We scan a limited number of messages per text channel (configurable) to mark users
+    who have previously spoken so they aren't kicked incorrectly.
+    """
+    await bot.wait_until_ready()
+    if not bot.guilds:
+        return
+    guild = bot.guilds[0]
+    logger.info("Sampling recent history in %s for active senders", guild.name)
+    for channel in guild.text_channels:
+        if not channel.permissions_for(guild.me).read_message_history:  # type: ignore
+            continue
+        try:
+            async for msg in channel.history(limit=CHANNEL_HISTORY_SAMPLING_LIMIT, oldest_first=False):
+                if msg.author.bot:
+                    continue
+                _active_senders.add(msg.author.id)
+        except Exception:
+            # Ignore history fetch errors / missing perms
+            continue
+    logger.info("Active sender sample size: %d", len(_active_senders))
+
+
+async def _inactivity_enforcement_loop():
+    await bot.wait_until_ready()
+    while not bot.is_closed():
+        try:
+            await _run_inactivity_check()
+        except Exception:
+            logger.exception("Inactivity enforcement loop iteration failed")
+        await asyncio.sleep(INACTIVE_CHECK_INTERVAL_SECONDS)
+
+
+async def _run_inactivity_check():
+    if not bot.guilds:
+        return
+    guild = bot.guilds[0]
+    if not guild.me.guild_permissions.kick_members:  # type: ignore
+        logger.debug("Skipping inactivity check: missing kick_members permission")
+        return
+    now = discord.utils.utcnow()
+    threshold = now.timestamp() - (INACTIVE_KICK_DAYS * 86400)
+    to_kick: list[discord.Member] = []
+    for member in guild.members:
+        if member.bot:
+            continue
+        # If they have spoken we skip
+        if member.id in _active_senders:
+            continue
+        joined_at = member.joined_at
+        if not joined_at:
+            continue
+        if joined_at.timestamp() <= threshold:
+            to_kick.append(member)
+    if not to_kick:
+        return
+    logger.info("Found %d inactive silent members to kick", len(to_kick))
+    for member in to_kick:
+        dm_text = (
+            "You've joined our server but haven't said anything yet. To prevent message scraping bots, "
+            "we've kicked you from the server. Feel free to rejoin at a later time."
+        )
+        try:
+            try:
+                await member.send(dm_text)
+            except discord.HTTPException:
+                pass
+            await guild.kick(member, reason="Possible message scraping bot; no messages for 7 days")
+            logger.info("Kicked inactive member %s (%s)", member, member.id)
+        except discord.Forbidden:
+            logger.warning("Forbidden kicking %s", member)
+        except discord.HTTPException:
+            logger.exception("HTTPException kicking %s", member)
 
 
 if __name__ == "__main__":
